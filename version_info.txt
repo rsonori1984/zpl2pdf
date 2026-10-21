@@ -1,0 +1,38 @@
+# UTF-8
+#
+# Informacoes de versao do executavel (Windows), usadas pelo PyInstaller:
+#   pyinstaller ... --version-file version_info.txt ...
+#
+# Ao lancar uma nova versao, atualize filevers, prodvers, FileVersion e
+# ProductVersion (e APP_VERSION no main.py, para o menu Ajuda > Sobre).
+
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '041604B0',
+        [
+          StringStruct('CompanyName', 'Rodrigo Onori'),
+          StringStruct('FileDescription', 'Conversor ZPL para PDF - Etiqueta 10x15'),
+          StringStruct('FileVersion', '1.0.0.0'),
+          StringStruct('InternalName', 'ZPL_para_PDF'),
+          StringStruct('LegalCopyright', '(c) 2026 Rodrigo Onori'),
+          StringStruct('OriginalFilename', 'ZPL_para_PDF.exe'),
+          StringStruct('ProductName', 'ZPL/TXT/ZIP para PDF'),
+          StringStruct('ProductVersion', '1.0.0.0')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct('Translation', [1046, 1200])])
+  ]
+)
