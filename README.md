@@ -19,19 +19,23 @@ Implementa um subconjunto do ZPL que cobre a maioria das etiquetas reais.
 Comandos raros (gráficos `^GF`, fontes customizadas da impressora, PDF417,
 DataMatrix) são ignorados. Se precisar deles, dá para estender o `zpl_parser.py`.
 
+## Imprimir direto
+
+O botão **Imprimir...** renderiza as etiquetas e abre o diálogo de impressão
+do sistema (Windows, macOS e Linux/CUPS), onde você escolhe a impressora.
+Cada etiqueta sai como uma página de 100x150 mm, sem margens. Usa as
+impressoras instaladas no sistema operacional (driver do fabricante).
+
+Dica: se a impressora tiver um papel/etiqueta pré-configurado de 10x15 cm
+no driver, selecione-o nas preferências do diálogo; o app pede 100x150 mm,
+mas alguns drivers só aceitam os tamanhos cadastrados.
+
 ## Rodar (qualquer SO)
 
 Pré-requisito: Python 3.9+.
 
 ```bash
 cd zpl2pdf
-py -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-python main.py
-
-ou
-
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -46,14 +50,20 @@ O PyInstaller empacota para o SO em que roda: gere o `.exe` no Windows, o
 **Windows** (cmd/PowerShell, uma linha):
 
 ```bat
-pyinstaller --noconfirm --windowed --onefile --name "ZPL_para_PDF" --add-data "assets;assets" main.py
+pyinstaller --noconfirm --clean --windowed --onefile --name "ZPL_para_PDF" --icon "assets\icons\icon.ico" --version-file version_info.txt --add-data "assets;assets" main.py
 ```
+
+As informações que aparecem em *clique direito no .exe → Propriedades → Detalhes*
+(versão, empresa, copyright) vêm do arquivo `version_info.txt`. Ao lançar uma nova
+versão, atualize ali `filevers`, `prodvers`, `FileVersion` e `ProductVersion`
+(e `APP_VERSION` no `main.py`, para o menu Ajuda → Sobre).
 
 **Linux / macOS**:
 
 ```bash
-pyinstaller --noconfirm --windowed --onefile \
+pyinstaller --noconfirm --clean --windowed --onefile \
     --name "ZPL_para_PDF" \
+    --icon "assets/icons/icon.ico" \
     --add-data "assets:assets" \
     main.py
 ```

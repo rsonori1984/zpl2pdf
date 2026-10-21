@@ -17,16 +17,18 @@ import traceback
 
 from PySide6.QtCore import Signal, QThread
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
+from PySide6.QtPrintSupport import QPrintDialog, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
-    QProgressBar, QMessageBox, QFrame, QComboBox, QTextEdit
+    QProgressBar, QMessageBox, QFrame, QComboBox, QTextEdit, QDialog
 )
 
-from converter import convert_files_to_pdf
+from converter import convert_files_to_pdf, render_label_images
+from printing import make_printer, print_images
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
 
@@ -52,6 +54,28 @@ class ConversionWorker(QThread):
         try:
             result = convert_files_to_pdf(
                 self.files, self.output_path, dpi=self.dpi,
+                progress_callback=lambda c, t, m: self.progress.emit(c, t, m),
+            )
+            self.finished_ok.emit(result)
+        except Exception:
+            self.finished_error.emit(traceback.format_exc())
+
+
+class RenderWorker(QThread):
+    """Renderiza as etiquetas em imagens (para imprimir), sem gerar PDF."""
+    progress = Signal(int, int, str)
+    finished_ok = Signal(object)
+    finished_error = Signal(str)
+
+    def __init__(self, files, dpi):
+        super().__init__()
+        self.files = files
+        self.dpi = dpi
+
+    def run(self):
+        try:
+            result = render_label_images(
+                self.files, dpi=self.dpi,
                 progress_callback=lambda c, t, m: self.progress.emit(c, t, m),
             )
             self.finished_ok.emit(result)
@@ -154,7 +178,19 @@ class MainWindow(QMainWindow):
             "QPushButton:disabled { background-color: #9ca3af; }"
         )
         self.btn_convert.clicked.connect(self.on_convert_clicked)
-        layout.addWidget(self.btn_convert)
+
+        self.btn_print = QPushButton("Imprimir...")
+        self.btn_print.setStyleSheet(
+            "QPushButton { background-color: white; color: #2563eb; padding: 10px; "
+            "font-weight: bold; border: 2px solid #2563eb; border-radius: 6px; } "
+            "QPushButton:disabled { color: #9ca3af; border-color: #9ca3af; }"
+        )
+        self.btn_print.clicked.connect(self.on_print_clicked)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.btn_convert, 2)
+        action_row.addWidget(self.btn_print, 1)
+        layout.addLayout(action_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -239,7 +275,7 @@ class MainWindow(QMainWindow):
         if not output_path.lower().endswith(".pdf"):
             output_path += ".pdf"
 
-        self.btn_convert.setEnabled(False)
+        self._set_busy(True)
         self.progress_bar.setValue(0)
         self.log_box.clear()
         self.status_label.setText("Convertendo...")
@@ -250,6 +286,65 @@ class MainWindow(QMainWindow):
         self.worker.finished_error.connect(self.on_finished_error)
         self.worker.start()
 
+    def _set_busy(self, busy):
+        self.btn_convert.setEnabled(not busy)
+        self.btn_print.setEnabled(not busy)
+
+    # --------------------------- impressão --------------------------- #
+    def on_print_clicked(self):
+        if not self.selected_files:
+            QMessageBox.warning(self, APP_TITLE, "Adicione pelo menos um arquivo .zpl, .txt ou .zip.")
+            return
+
+        if not QPrinterInfo.availablePrinterNames():
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "Nenhuma impressora foi encontrada neste computador.\n"
+                "Instale ou conecte uma impressora e tente novamente."
+            )
+            return
+
+        self._set_busy(True)
+        self.progress_bar.setValue(0)
+        self.log_box.clear()
+        self.status_label.setText("Preparando etiquetas para impressão...")
+
+        self.worker = RenderWorker(list(self.selected_files), self.dpi_value())
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_render_done)
+        self.worker.finished_error.connect(self.on_finished_error)
+        self.worker.start()
+
+    def on_render_done(self, result):
+        self._set_busy(False)
+        self.progress_bar.setValue(self.progress_bar.maximum())
+
+        for w in result.warnings:
+            self.log_box.append("⚠ " + w)
+
+        if not result.images:
+            self.status_label.setText("Não há etiquetas para imprimir. Veja os avisos abaixo.")
+            return
+
+        printer = make_printer()
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle(f"Imprimir {len(result.images)} etiqueta(s)")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Impressão cancelada.")
+            return
+
+        try:
+            print_images(result.images, printer)
+        except Exception as e:
+            self.status_label.setText("Falha ao imprimir.")
+            self.log_box.append(f"ERRO ao imprimir: {e}")
+            QMessageBox.critical(self, APP_TITLE, f"Não foi possível imprimir:\n{e}")
+            return
+
+        self.status_label.setText(
+            f"{len(result.images)} etiqueta(s) enviada(s) para a impressora."
+        )
+
     def on_progress(self, cur, total, msg):
         if total > 0:
             self.progress_bar.setMaximum(total)
@@ -257,7 +352,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(msg)
 
     def on_finished_ok(self, result):
-        self.btn_convert.setEnabled(True)
+        self._set_busy(False)
         self.progress_bar.setValue(self.progress_bar.maximum())
 
         if result.pdf_path:
@@ -280,7 +375,7 @@ class MainWindow(QMainWindow):
                 self.open_file(result.pdf_path)
 
     def on_finished_error(self, error_text):
-        self.btn_convert.setEnabled(True)
+        self._set_busy(False)
         self.status_label.setText("Ocorreu um erro durante a conversão.")
         self.log_box.append("ERRO:\n" + error_text)
         QMessageBox.critical(self, APP_TITLE, "Ocorreu um erro durante a conversão. Veja o log na janela.")
