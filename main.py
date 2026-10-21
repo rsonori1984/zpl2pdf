@@ -16,7 +16,7 @@ import sys
 import traceback
 
 from PySide6.QtCore import Signal, QThread
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
@@ -29,6 +29,12 @@ APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
 APP_VERSION = "1.0.0"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
+
+
+def resource_path(*parts):
+    """Caminho de um recurso, funcionando rodando pelo Python e empacotado (.exe)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
 
 
 class ConversionWorker(QThread):
@@ -295,6 +301,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setWindowIcon(QIcon(resource_path("assets/imgs", "icon.png")))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
