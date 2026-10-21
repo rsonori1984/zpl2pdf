@@ -1,0 +1,21 @@
+# Ambiente virtual
+venv/
+.venv/
+
+# Arquivos gerados pelo PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / sistema
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# PDFs de teste gerados
+*.pdf
