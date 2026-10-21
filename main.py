@@ -16,7 +16,7 @@ import sys
 import traceback
 
 from PySide6.QtCore import Signal, QThread
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
 from converter import convert_files_to_pdf
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
+APP_VERSION = "1.0.0"
+APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
 
 
@@ -83,6 +85,8 @@ class MainWindow(QMainWindow):
         self.resize(680, 600)
         self.selected_files = []
         self.worker = None
+
+        self._build_menu()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -159,6 +163,33 @@ class MainWindow(QMainWindow):
         self.log_box.setMaximumHeight(120)
         self.log_box.setPlaceholderText("Avisos e mensagens aparecerão aqui...")
         layout.addWidget(self.log_box)
+
+    # ------------------------------------------------------------------ #
+    def _build_menu(self):
+        help_menu = self.menuBar().addMenu("&Ajuda")
+
+        about_action = QAction("&Sobre", self)
+        about_action.setShortcut(QKeySequence("F1"))
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+        # about_qt_action = QAction("Sobre o &Qt", self)
+        # about_qt_action.triggered.connect(QApplication.aboutQt)
+        # help_menu.addAction(about_qt_action)
+
+    def show_about(self):
+        QMessageBox.about(
+            self,
+            "Sobre",
+            f"<h3>{APP_TITLE}</h3>"
+            f"<p>Versão {APP_VERSION}</p>"
+            "<p>Converte arquivos ZPL (.zpl, .txt e .zip) em PDF no formato "
+            "de etiqueta 10x15 cm, pronto para impressão. Funciona 100% offline.</p>"
+            "<p><b>Bibliotecas utilizadas:</b><br>"
+            "PySide6 (interface), Pillow, ReportLab, python-barcode, qrcode "
+            "e fonte DejaVu Sans Mono.</p>"
+            f"<p>Desenvolvido por {APP_AUTHOR}.</p>"
+        )
 
     # ------------------------------------------------------------------ #
     def dpi_value(self):
