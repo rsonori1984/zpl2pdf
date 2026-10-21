@@ -8,16 +8,19 @@ caixas/linhas) em uma imagem PIL, sem depender de nenhum serviço externo.
 Não é um emulador 100% completo da linguagem ZPL (que é enorme), mas cobre
 o que é usado na grande maioria das etiquetas geradas por ERPs, e-commerces
 e transportadoras: ^FO/^FT, ^A, ^FD/^FS, ^BC, ^BQ, ^GB, ^BY, ^CF, ^PW, ^LL,
-^LH, ^FB.
+^LH, ^FB e imagens (^GF, ~DG + ^XG), inclusive comprimidas (:Z64:/:B64:).
 
 Comandos não suportados são simplesmente ignorados (não quebram a
 renderização).
 """
 
+import base64
 import io
 import os
+import re
 import sys
-from PIL import Image, ImageDraw, ImageFont
+import zlib
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 try:
     import barcode
@@ -71,6 +74,174 @@ def split_labels(zpl_text: str):
     # fallback: comandos ZPL soltos, sem ^XA/^XZ
     if not labels and "^" in text:
         labels.append(text)
+    return labels
+
+
+# ---------------------------------------------------------------------- #
+# Imagens ZPL (~DG / ^XG / ^GF)
+# ---------------------------------------------------------------------- #
+_DG_RE = re.compile(r"~DG([^,\^~]*),(\d+),(\d+),", re.IGNORECASE)
+_XZ_RE = re.compile(r"\^XZ", re.IGNORECASE)
+_HEX_CHARS = set("0123456789ABCDEFabcdef")
+_RLE_CHARS = set("GHIJKLMNOPQRSTUVWXYghijklmnopqrstuvwxyz,!:")
+_WS_CHARS = set(" \t\r\n")
+# comandos que desenham alguma coisa (usado para descartar blocos vazios,
+# como o "^XA^IDR:ARQ.GRF^FS^XZ" que só apaga uma imagem da memória)
+_DRAWING_RE = re.compile(r"\^(?:FD|GB|GC|GD|GE|XG|GF|IM)", re.IGNORECASE)
+
+
+def normalize_graphic_name(name: str) -> str:
+    """'R:DEMO.GRF' -> 'DEMO.GRF' (ignora a letra da unidade, maiúsculas)."""
+    name = (name or "").strip()
+    if ":" in name:
+        name = name.split(":", 1)[1]
+    name = name.upper()
+    if name and "." not in name:
+        name += ".GRF"
+    return name
+
+
+def _decode_hex_rle(text: str, bytes_per_row: int) -> bytes:
+    """Decodifica o formato ASCII hexadecimal do ZPL, com a compressão RLE
+    (G-Y = repete 1..19, g-z = repete 20..400, ',' completa a linha com 0,
+    '!' completa com F, ':' repete a linha anterior)."""
+    row_len = bytes_per_row * 2
+    rows = []
+    row = ""
+    prev = ""
+    count = 0
+
+    def push(chunk):
+        nonlocal row, prev
+        row += chunk
+        while len(row) >= row_len:
+            prev = row[:row_len]
+            rows.append(prev)
+            row = row[row_len:]
+
+    for ch in text:
+        if ch in _WS_CHARS:
+            continue
+        if ch in _HEX_CHARS:
+            push(ch * (count or 1))
+            count = 0
+        elif "G" <= ch <= "Y":
+            count += ord(ch) - ord("F")
+        elif "g" <= ch <= "z":
+            count += 20 * (ord(ch) - ord("f"))
+        elif ch == ",":
+            push("0" * (row_len - len(row)) if row else "0" * row_len)
+            count = 0
+        elif ch == "!":
+            push("F" * (row_len - len(row)) if row else "F" * row_len)
+            count = 0
+        elif ch == ":":
+            if not row and prev:
+                push(prev)
+            count = 0
+    if len(row) >= 2:
+        rows.append(row.ljust(row_len, "0"))
+    try:
+        return bytes.fromhex("".join(rows))
+    except ValueError:
+        return b""
+
+
+def decode_graphic(payload: str, bytes_per_row: int, total: int = 0):
+    """Converte os dados de uma imagem ZPL (hex, hex+RLE, :B64: ou :Z64:) em
+    uma imagem PIL no modo '1' (0 = preto, 1 = branco). Retorna None se os
+    dados forem inválidos."""
+    if bytes_per_row <= 0:
+        return None
+    payload = payload.strip()
+    try:
+        if payload.startswith(":"):
+            parts = payload.split(":")           # ['', 'Z64', dados, crc]
+            kind = parts[1].upper() if len(parts) > 1 else ""
+            raw = base64.b64decode("".join(parts[2].split()) if len(parts) > 2 else "")
+            if kind == "Z64":
+                raw = zlib.decompress(raw)
+            elif kind != "B64":
+                return None
+            # o conteúdo pode ser o bitmap binário ou o texto hex (+RLE)
+            if total and len(raw) == total:
+                data = raw
+            elif raw and all(chr(b) in _HEX_CHARS | _RLE_CHARS | _WS_CHARS for b in raw):
+                data = _decode_hex_rle(raw.decode("ascii"), bytes_per_row)
+            else:
+                data = raw
+        else:
+            data = _decode_hex_rle(payload, bytes_per_row)
+    except Exception:
+        return None
+
+    rows = len(data) // bytes_per_row
+    if rows <= 0:
+        return None
+    data = data[: rows * bytes_per_row]
+    # em ZPL, bit 1 = ponto preto; no modo '1' do PIL, 0 = preto
+    inverted = data.translate(bytes(255 - i for i in range(256)))
+    return Image.frombytes("1", (bytes_per_row * 8, rows), inverted)
+
+
+class ParsedLabel:
+    """Uma etiqueta (texto ^XA...^XZ) e as imagens ~DG disponíveis nela."""
+
+    def __init__(self, zpl, graphics):
+        self.zpl = zpl
+        self.graphics = graphics
+
+
+def _read_dg(text, match, graphics):
+    """Lê os dados do ~DG que começa em `match`, registra em `graphics` e
+    devolve a posição logo após os dados."""
+    start = match.end()
+    end = start
+    n = len(text)
+    while end < n and text[end] not in "^~":
+        end += 1
+    img = decode_graphic(text[start:end], int(match.group(3)), int(match.group(2)))
+    name = normalize_graphic_name(match.group(1))
+    if img is not None:
+        graphics[name] = img
+    else:
+        graphics.pop(name, None)
+    return end
+
+
+def has_drawing(zpl_label: str) -> bool:
+    """True se o bloco desenha algo (texto, caixa, código, imagem...)."""
+    return bool(_DRAWING_RE.search(zpl_label))
+
+
+def parse_labels(zpl_text: str):
+    """Como split_labels, mas processa o arquivo em ordem e registra as
+    imagens ~DG (que podem vir ANTES do ^XA e ser redefinidas com o mesmo
+    nome a cada etiqueta). Retorna uma lista de ParsedLabel."""
+    graphics = {}
+    labels = []
+    text = zpl_text
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "~" and text[i + 1:i + 3].upper() == "DG":
+            m = _DG_RE.match(text, i)
+            if m:
+                i = _read_dg(text, m, graphics)
+                continue
+        elif ch == "^" and text[i + 1:i + 3].upper() == "XA":
+            xz = _XZ_RE.search(text, i + 3)
+            end = xz.end() if xz else n
+            block = text[i:end]
+            for m in _DG_RE.finditer(block):      # ~DG dentro do próprio bloco
+                _read_dg(block, m, graphics)
+            labels.append(ParsedLabel(block, dict(graphics)))
+            i = end
+            continue
+        i += 1
+    if not labels and "^" in text:
+        labels.append(ParsedLabel(text, dict(graphics)))
     return labels
 
 
@@ -133,25 +304,50 @@ class ZPLRenderer:
     # ------------------------------------------------------------------ #
     # Render principal
     # ------------------------------------------------------------------ #
-    def render(self, zpl_label: str) -> Image.Image:
+    def render(self, zpl_label: str, graphics=None) -> Image.Image:
+        """`graphics` = imagens ~DG disponíveis (nome normalizado -> imagem)."""
+        graphics = graphics or {}
         tokens = self._tokenize(zpl_label)
         self._pending_barcode = None
 
         canvas_w = self.default_w
         canvas_h = self.default_h
         home_x, home_y = 0, 0
+        width_set = height_set = False
+        need_w = need_h = 0
+        bitmaps = {}   # índice do token -> (imagem, ampliação x, ampliação y)
 
-        # primeiro passe: tamanho real (^PW / ^LL / ^LH)
-        for code, params in tokens:
+        # primeiro passe: tamanho real (^PW / ^LL / ^LH) e imagens (^XG / ^GF)
+        fx, fy = 0, 0
+        for idx, (code, params) in enumerate(tokens):
             if code == "PW":
                 canvas_w = self._first_int(params, canvas_w)
+                width_set = True
             elif code == "LL":
                 canvas_h = self._first_int(params, canvas_h)
+                height_set = True
             elif code == "LH":
                 parts = params.split(",")
                 if len(parts) >= 2:
                     home_x = self._to_int(parts[0], 0)
                     home_y = self._to_int(parts[1], 0)
+            elif code in ("FO", "FT"):
+                parts = params.split(",")
+                fx = home_x + (self._to_int(parts[0], 0) if len(parts) > 0 else 0)
+                fy = home_y + (self._to_int(parts[1], 0) if len(parts) > 1 else 0)
+            elif code in ("XG", "GF"):
+                found = self._resolve_bitmap(code, params, graphics)
+                if found is not None:
+                    bitmaps[idx] = found
+                    bmp, mx, my = found
+                    need_w = max(need_w, fx + bmp.width * mx)
+                    need_h = max(need_h, fy + bmp.height * my)
+
+        # sem ^PW/^LL explícitos, a etiqueta cresce para caber a imagem
+        if not width_set:
+            canvas_w = max(canvas_w, need_w)
+        if not height_set:
+            canvas_h = max(canvas_h, need_h)
 
         img = Image.new("RGB", (max(canvas_w, 10), max(canvas_h, 10)), "white")
         draw = ImageDraw.Draw(img)
@@ -163,8 +359,12 @@ class ZPLRenderer:
         bc_height = 100
         fb_width = None
 
-        for code, params in tokens:
-            if code in ("FO", "FT"):
+        for idx, (code, params) in enumerate(tokens):
+            if code in ("XG", "GF"):
+                if idx in bitmaps:
+                    self._draw_bitmap(img, cur_x, cur_y, *bitmaps[idx])
+
+            elif code in ("FO", "FT"):
                 parts = params.split(",")
                 cur_x = home_x + self._to_int(parts[0], 0) if len(parts) > 0 else home_x
                 cur_y = home_y + self._to_int(parts[1], 0) if len(parts) > 1 else home_y
@@ -259,6 +459,33 @@ class ZPLRenderer:
         if cur:
             lines.append(cur)
         return lines
+
+    def _resolve_bitmap(self, code, params, graphics):
+        """Devolve (imagem modo '1', ampliação x, ampliação y) ou None."""
+        if code == "XG":                       # ^XGnome,mx,my
+            parts = params.split(",")
+            bmp = graphics.get(normalize_graphic_name(parts[0]))
+            if bmp is None:
+                return None
+            mx = max(self._to_int(parts[1], 1), 1) if len(parts) > 1 else 1
+            my = max(self._to_int(parts[2], 1), 1) if len(parts) > 2 else 1
+            return bmp, mx, my
+        # ^GFformato,total,total2,bytes_por_linha,dados
+        parts = params.split(",", 4)
+        if len(parts) < 5 or parts[0].strip().upper() != "A":
+            return None
+        bpr = self._to_int(parts[3], 0)
+        total = self._to_int(parts[1], 0)
+        bmp = decode_graphic(parts[4], bpr, total)
+        return (bmp, 1, 1) if bmp is not None else None
+
+    @staticmethod
+    def _draw_bitmap(img, x, y, bmp, mx, my):
+        if mx != 1 or my != 1:
+            bmp = bmp.resize((bmp.width * mx, bmp.height * my), Image.NEAREST)
+        # só os pontos pretos são impressos; o branco não apaga o que já existe
+        mask = ImageOps.invert(bmp.convert("L"))
+        img.paste((0, 0, 0), (x, y), mask)
 
     def _draw_box(self, draw, x, y, params):
         pieces = params.split(",")

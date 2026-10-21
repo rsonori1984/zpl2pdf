@@ -2,7 +2,8 @@
 converter.py
 
 Orquestra a conversão de arquivos .zpl / .txt / .zip contendo etiquetas ZPL
-para um único PDF pronto para impressão, no formato de etiqueta 10x15 cm.
+para imagens de etiqueta (para imprimir) ou para um único PDF no formato
+10x15 cm (o tamanho mais usado por transportadoras/e-commerce no Brasil).
 
 Fluxo:
   1. Recebe uma lista de caminhos de arquivo (.zpl, .txt ou .zip)
@@ -10,8 +11,9 @@ Fluxo:
   3. Lê o conteúdo de cada arquivo e detecta se é ZPL válido
   4. Divide o conteúdo em etiquetas individuais (^XA...^XZ)
   5. Renderiza cada etiqueta como imagem via ZPLRenderer
-  6. Ajusta cada imagem para a página 10x15 cm
-  7. Monta um PDF (uma página por etiqueta) com reportlab
+     (render_label_images)
+  6. Opcionalmente monta um PDF, uma página 10x15 por etiqueta
+     (convert_files_to_pdf)
 """
 
 import os
@@ -19,12 +21,11 @@ import shutil
 import tempfile
 import zipfile
 
-from PIL import Image
 from reportlab.lib.pagesizes import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdfcanvas
 
-from zpl_parser import ZPLRenderer, split_labels
+from zpl_parser import ZPLRenderer, has_drawing, parse_labels
 
 LABEL_WIDTH_MM = 100.0
 LABEL_HEIGHT_MM = 150.0
@@ -38,6 +39,7 @@ class ConversionResult:
         self.total_labels = 0
         self.files_processed = []
         self.warnings = []
+        self.images = []  # imagens PIL, uma por etiqueta
 
 
 def is_probably_zpl(text: str) -> bool:
@@ -93,10 +95,12 @@ def read_text_any_encoding(path):
         return f.read().decode("utf-8", errors="replace")
 
 
-def convert_files_to_pdf(input_paths, output_pdf_path, dpi=203, progress_callback=None):
-    """Converte os arquivos de entrada em um único PDF de etiquetas 10x15cm.
+def render_label_images(input_paths, dpi=203, progress_callback=None):
+    """Lê os arquivos de entrada e renderiza cada etiqueta como imagem PIL.
 
-    progress_callback(current, total, message) reporta o progresso.
+    Retorna um ConversionResult com .images, .warnings, .files_processed e
+    .total_labels. Não gera PDF. progress_callback(current, total, message)
+    reporta o progresso.
     """
     result = ConversionResult()
     files, tmp_dir = collect_input_files(input_paths)
@@ -109,7 +113,6 @@ def convert_files_to_pdf(input_paths, output_pdf_path, dpi=203, progress_callbac
             return result
 
         renderer = ZPLRenderer(dpi=dpi, width_mm=LABEL_WIDTH_MM, height_mm=LABEL_HEIGHT_MM)
-        all_label_images = []
 
         for idx, fpath in enumerate(files):
             if progress_callback:
@@ -123,7 +126,7 @@ def convert_files_to_pdf(input_paths, output_pdf_path, dpi=203, progress_callbac
                 )
                 continue
 
-            labels = split_labels(text)
+            labels = parse_labels(text)
             if not labels:
                 result.warnings.append(
                     f"'{os.path.basename(fpath)}' não contém blocos ^XA...^XZ reconhecíveis."
@@ -131,8 +134,12 @@ def convert_files_to_pdf(input_paths, output_pdf_path, dpi=203, progress_callbac
                 continue
 
             for lbl in labels:
+                # blocos que não desenham nada (ex.: ^XA^IDR:ARQ.GRF^FS^XZ,
+                # que só apaga uma imagem da memória) não viram página
+                if not has_drawing(lbl.zpl):
+                    continue
                 try:
-                    all_label_images.append(renderer.render(lbl))
+                    result.images.append(renderer.render(lbl.zpl, lbl.graphics))
                 except Exception as e:
                     result.warnings.append(
                         f"Falha ao renderizar uma etiqueta de '{os.path.basename(fpath)}': {e}"
@@ -140,38 +147,44 @@ def convert_files_to_pdf(input_paths, output_pdf_path, dpi=203, progress_callbac
 
             result.files_processed.append(os.path.basename(fpath))
 
-        if not all_label_images:
+        if not result.images:
             result.warnings.append("Nenhuma etiqueta pôde ser renderizada.")
-            return result
 
-        # Uma página de 100x150mm por etiqueta
-        page_w = LABEL_WIDTH_MM * mm
-        page_h = LABEL_HEIGHT_MM * mm
-        c = pdfcanvas.Canvas(output_pdf_path, pagesize=(page_w, page_h))
-
-        for i, img in enumerate(all_label_images):
-            if progress_callback:
-                progress_callback(i, len(all_label_images),
-                                  f"Gerando página {i + 1}/{len(all_label_images)}")
-
-            # Mantém a proporção e alinha ao topo-esquerda da página, como a
-            # impressora térmica faria (sem esticar nem centralizar).
-            img_w, img_h = img.size
-            scale = min(page_w / img_w, page_h / img_h)
-            draw_w = img_w * scale
-            draw_h = img_h * scale
-            off_x = 0
-            off_y = page_h - draw_h
-
-            c.drawImage(ImageReader(img), off_x, off_y, width=draw_w, height=draw_h)
-            c.showPage()
-
-        c.save()
-
-        result.pdf_path = output_pdf_path
-        result.total_labels = len(all_label_images)
+        result.total_labels = len(result.images)
         return result
 
     finally:
         if tmp_dir and os.path.isdir(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def convert_files_to_pdf(input_paths, output_pdf_path, dpi=203, progress_callback=None):
+    """Converte os arquivos de entrada em um único PDF de etiquetas 10x15cm."""
+    result = render_label_images(input_paths, dpi=dpi, progress_callback=progress_callback)
+    if not result.images:
+        return result
+
+    page_w = LABEL_WIDTH_MM * mm
+    page_h = LABEL_HEIGHT_MM * mm
+    c = pdfcanvas.Canvas(output_pdf_path, pagesize=(page_w, page_h))
+
+    for i, img in enumerate(result.images):
+        if progress_callback:
+            progress_callback(i, len(result.images),
+                              f"Gerando página {i + 1}/{len(result.images)}")
+
+        # Mantém a proporção e alinha ao topo-esquerda da página, como a
+        # impressora térmica faria (sem esticar nem centralizar).
+        img_w, img_h = img.size
+        scale = min(page_w / img_w, page_h / img_h)
+        draw_w = img_w * scale
+        draw_h = img_h * scale
+        off_x = 0
+        off_y = page_h - draw_h
+
+        c.drawImage(ImageReader(img), off_x, off_y, width=draw_w, height=draw_h)
+        c.showPage()
+
+    c.save()
+    result.pdf_path = output_pdf_path
+    return result
