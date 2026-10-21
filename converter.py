@@ -25,7 +25,7 @@ from reportlab.lib.pagesizes import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdfcanvas
 
-from zpl_parser import ZPLRenderer, split_labels
+from zpl_parser import ZPLRenderer, has_drawing, parse_labels
 
 LABEL_WIDTH_MM = 100.0
 LABEL_HEIGHT_MM = 150.0
@@ -126,7 +126,7 @@ def render_label_images(input_paths, dpi=203, progress_callback=None):
                 )
                 continue
 
-            labels = split_labels(text)
+            labels = parse_labels(text)
             if not labels:
                 result.warnings.append(
                     f"'{os.path.basename(fpath)}' não contém blocos ^XA...^XZ reconhecíveis."
@@ -134,8 +134,12 @@ def render_label_images(input_paths, dpi=203, progress_callback=None):
                 continue
 
             for lbl in labels:
+                # blocos que não desenham nada (ex.: ^XA^IDR:ARQ.GRF^FS^XZ,
+                # que só apaga uma imagem da memória) não viram página
+                if not has_drawing(lbl.zpl):
+                    continue
                 try:
-                    result.images.append(renderer.render(lbl))
+                    result.images.append(renderer.render(lbl.zpl, lbl.graphics))
                 except Exception as e:
                     result.warnings.append(
                         f"Falha ao renderizar uma etiqueta de '{os.path.basename(fpath)}': {e}"

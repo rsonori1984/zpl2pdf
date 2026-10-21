@@ -28,7 +28,7 @@ from converter import convert_files_to_pdf, render_label_images
 from printing import make_printer, print_images
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.0.1"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
 
@@ -366,10 +366,22 @@ class MainWindow(QMainWindow):
             self.log_box.append("⚠ " + w)
 
         if result.pdf_path:
+            # 1) limpar a lista de arquivos? (padrão: Não, para um Enter
+            #    sem querer não apagar a lista)
             resp = QMessageBox.question(
                 self, APP_TITLE,
-                f"PDF gerado com sucesso!\n{result.total_labels} etiqueta(s).\n\nAbrir o arquivo agora?",
-                QMessageBox.Yes | QMessageBox.No
+                f"PDF gerado com sucesso!\n{result.total_labels} etiqueta(s).\n\n"
+                "Deseja limpar a lista de arquivos?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if resp == QMessageBox.Yes:
+                self.on_clear_clicked()
+
+            # 2) abrir o PDF gerado?
+            resp = QMessageBox.question(
+                self, APP_TITLE,
+                "Abrir o arquivo PDF agora?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
             )
             if resp == QMessageBox.Yes:
                 self.open_file(result.pdf_path)
