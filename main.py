@@ -28,7 +28,7 @@ from converter import convert_files_to_pdf, render_label_images
 from printing import make_printer, print_images
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
 
@@ -215,6 +215,10 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
 
+        common_errors_action = QAction("Erros &comuns", self)
+        common_errors_action.triggered.connect(self.show_common_errors)
+        help_menu.addAction(common_errors_action)
+
         # about_qt_action = QAction("Sobre o &Qt", self)
         # about_qt_action.triggered.connect(QApplication.aboutQt)
         # help_menu.addAction(about_qt_action)
@@ -231,6 +235,22 @@ class MainWindow(QMainWindow):
             "PySide6 (interface), Pillow, ReportLab, python-barcode, qrcode "
             "e fonte DejaVu Sans Mono.</p>"
             f"<p>Desenvolvido por {APP_AUTHOR}.</p>"
+        )
+
+    def show_common_errors(self):
+        QMessageBox.information(
+            self,
+            "Erros comuns",
+            "<h3>Erros comuns</h3>"
+            "<ul>"
+            "<li><b>Não há etiquetas para imprimir:</b> O arquivo não contém "
+            "comandos ZPL válidos, ou não há etiquetas completas (^XA...^XZ).</li>"
+            "<li><b>Falha ao imprimir:</b> Nenhuma impressora foi encontrada, ou "
+            "houve falha na comunicação com a impressora. Verifique se a impressora "
+            "está ligada, conectada e com drivers instalados.</li>"
+            "<li><b>Falha ao gerar PDF:</b> O arquivo de saída está aberto em outro "
+            "programa (como o Adobe Acrobat). Feche o arquivo e tente novamente.</li>"
+            "</ul>"
         )
 
     # ------------------------------------------------------------------ #
