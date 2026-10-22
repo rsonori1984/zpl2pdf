@@ -28,7 +28,7 @@ from converter import convert_files_to_pdf, render_label_images
 from printing import make_printer, print_images
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.1"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
 
