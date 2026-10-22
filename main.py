@@ -39,6 +39,33 @@ def resource_path(*parts):
     return os.path.join(base, *parts)
 
 
+# Variáveis que apontam para bibliotecas do snap / do app empacotado. Se um
+# programa externo (leitor de PDF) as herdar, pode carregar bibliotecas
+# incompatíveis e mostrar erros como "GLIBCXX_3.4.29 not found".
+_LIB_ENV_VARS = (
+    "LD_LIBRARY_PATH", "LD_PRELOAD", "GIO_MODULE_DIR", "GIO_EXTRA_MODULES",
+    "GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE",
+    "GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR", "LOCPATH",
+)
+
+
+def clean_env_for_external_apps():
+    """Cópia do ambiente, sem as variáveis de bibliotecas do snap (terminal do
+    VS Code instalado como snap) nem do PyInstaller, para abrir outros
+    programas (xdg-open) sem herdar bibliotecas incompatíveis."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False):
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original is not None:
+            env["LD_LIBRARY_PATH"] = original
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    if "SNAP" in env:
+        for name in _LIB_ENV_VARS:
+            env.pop(name, None)
+    return env
+
+
 class ConversionWorker(QThread):
     progress = Signal(int, int, str)
     finished_ok = Signal(object)
@@ -133,7 +160,7 @@ class MainWindow(QMainWindow):
 
         subtitle = QLabel(
             "Arraste arquivos .zpl, .txt ou .zip aqui, ou use o botão abaixo.\n"
-            "Cada etiqueta será convertida em uma página de PDF no tamanho 10x15 cm."
+            "Converta para um PDF (uma página 10x15 cm por etiqueta) ou imprima direto."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #555;")
@@ -206,6 +233,18 @@ class MainWindow(QMainWindow):
         self.log_box.setPlaceholderText("Avisos e mensagens aparecerão aqui...")
         layout.addWidget(self.log_box)
 
+    def closeEvent(self, event):
+        # fechar com a conversão/leitura rodando derruba o programa
+        # ("QThread: Destroyed while thread is still running")
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(
+                self, APP_TITLE,
+                "Há uma operação em andamento. Aguarde ela terminar para fechar o programa."
+            )
+            event.ignore()
+            return
+        event.accept()
+
     # ------------------------------------------------------------------ #
     def _build_menu(self):
         help_menu = self.menuBar().addMenu("&Ajuda")
@@ -230,7 +269,8 @@ class MainWindow(QMainWindow):
             f"<h3>{APP_TITLE}</h3>"
             f"<p>Versão {APP_VERSION}</p>"
             "<p>Converte arquivos ZPL (.zpl, .txt e .zip) em PDF no formato "
-            "de etiqueta 10x15 cm, pronto para impressão. Funciona 100% offline.</p>"
+            "de etiqueta 10x15 cm ou imprime direto na impressora. "
+            "Funciona 100% offline.</p>"
             "<p><b>Bibliotecas utilizadas:</b><br>"
             "PySide6 (interface), Pillow, ReportLab, python-barcode, qrcode "
             "e fonte DejaVu Sans Mono.</p>"
@@ -353,17 +393,28 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Impressão cancelada.")
             return
 
+        self._set_busy(True)
+        self.progress_bar.setValue(0)
         try:
-            print_images(result.images, printer)
+            print_images(result.images, printer, progress=self._on_print_progress)
         except Exception as e:
             self.status_label.setText("Falha ao imprimir.")
             self.log_box.append(f"ERRO ao imprimir: {e}")
             QMessageBox.critical(self, APP_TITLE, f"Não foi possível imprimir:\n{e}")
             return
+        finally:
+            self._set_busy(False)
 
         self.status_label.setText(
             f"{len(result.images)} etiqueta(s) enviada(s) para a impressora."
         )
+
+    def _on_print_progress(self, done, total):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+        self.status_label.setText(f"Imprimindo etiqueta {done} de {total}...")
+        # mantém a janela respondendo durante a impressão de lotes grandes
+        QApplication.processEvents()
 
     def on_progress(self, cur, total, msg):
         if total > 0:
@@ -408,9 +459,9 @@ class MainWindow(QMainWindow):
 
     def on_finished_error(self, error_text):
         self._set_busy(False)
-        self.status_label.setText("Ocorreu um erro durante a conversão.")
+        self.status_label.setText("Ocorreu um erro.")
         self.log_box.append("ERRO:\n" + error_text)
-        QMessageBox.critical(self, APP_TITLE, "Ocorreu um erro durante a conversão. Veja o log na janela.")
+        QMessageBox.critical(self, APP_TITLE, "Ocorreu um erro. Veja o log na janela.")
 
     @staticmethod
     def open_file(path):
@@ -420,7 +471,11 @@ class MainWindow(QMainWindow):
             elif sys.platform.startswith("win"):
                 os.startfile(path)  # noqa
             else:
-                subprocess.Popen(["xdg-open", path])
+                subprocess.Popen(
+                    ["xdg-open", path], env=clean_env_for_external_apps(),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
         except Exception:
             pass
 

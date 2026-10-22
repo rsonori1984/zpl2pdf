@@ -22,13 +22,17 @@ DataMatrix) são ignorados. Se precisar deles, dá para estender o `zpl_parser.p
 ## Imprimir direto
 
 O botão **Imprimir...** renderiza as etiquetas e abre o diálogo de impressão
-do sistema (Windows, macOS e Linux/CUPS), onde você escolhe a impressora.
-Cada etiqueta sai como uma página de 100x150 mm, sem margens. Usa as
-impressoras instaladas no sistema operacional (driver do fabricante).
+do sistema (Windows, macOS e Linux/CUPS), onde você escolhe a impressora e o papel.
 
-Dica: se a impressora tiver um papel/etiqueta pré-configurado de 10x15 cm
-no driver, selecione-o nas preferências do diálogo; o app pede 100x150 mm,
-mas alguns drivers só aceitam os tamanhos cadastrados.
+- **Tamanho:** a etiqueta sai com 100x150 mm. Em papel de etiqueta (10x15 cm,
+  4x6 polegadas...) ela preenche a página; em outro papel (por exemplo A4),
+  sai no canto superior esquerdo, no tamanho real. O papel que você escolhe no
+  diálogo é respeitado.
+- **Nitidez:** a imagem é ajustada à resolução da impressora e enviada em preto
+  e branco puro, para o driver não borrar as barras dos códigos de barras.
+- **Melhor resultado:** use o papel que corresponde à etiqueta. Etiquetas de
+  marketplace costumam ter 4x6 polegadas (101,6 x 152,4 mm); em papel de
+  100x150 mm elas são reduzidas cerca de 2%.
 
 ## Rodar (qualquer SO)
 
