@@ -15,7 +15,7 @@ import subprocess
 import sys
 import traceback
 
-from PySide6.QtCore import Signal, QThread
+from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PySide6.QtPrintSupport import QPrintDialog, QPrinterInfo
 from PySide6.QtWidgets import (
@@ -142,6 +142,8 @@ class MainWindow(QMainWindow):
         self.resize(680, 600)
         self.selected_files = []
         self.worker = None
+        self._busy = False        # conversão, leitura ou impressão em andamento
+        self._close_box = None    # aviso "aguarde" (mantido para não repetir)
 
         self._build_menu()
 
@@ -234,16 +236,28 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_box)
 
     def closeEvent(self, event):
-        # fechar com a conversão/leitura rodando derruba o programa
-        # ("QThread: Destroyed while thread is still running")
-        if self.worker is not None and self.worker.isRunning():
-            QMessageBox.information(
-                self, APP_TITLE,
-                "Há uma operação em andamento. Aguarde ela terminar para fechar o programa."
-            )
+        # Fechar no meio de uma conversão, leitura ou impressão derrubaria o
+        # programa (thread ainda rodando) ou interromperia a impressão.
+        if self._busy or (self.worker is not None and self.worker.isRunning()):
+            self._warn_busy_on_close()
             event.ignore()
             return
         event.accept()
+
+    def _warn_busy_on_close(self):
+        # Aviso que NÃO pausa o trabalho (open() não bloqueia): na impressão o
+        # laço de eventos precisa continuar rodando enquanto o aviso aparece.
+        if self._close_box is not None and self._close_box.isVisible():
+            return
+        box = QMessageBox(
+            QMessageBox.Icon.Information, APP_TITLE,
+            "Há uma operação em andamento (conversão ou impressão).\n"
+            "Aguarde ela terminar para fechar o programa.",
+            QMessageBox.StandardButton.Ok, self,
+        )
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.open()
+        self._close_box = box
 
     # ------------------------------------------------------------------ #
     def _build_menu(self):
@@ -347,6 +361,7 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def _set_busy(self, busy):
+        self._busy = busy
         self.btn_convert.setEnabled(not busy)
         self.btn_print.setEnabled(not busy)
 
