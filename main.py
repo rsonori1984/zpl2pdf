@@ -10,31 +10,150 @@ Como rodar (com Python instalado):
     python main.py
 """
 
+import json
 import os
+import re
 import subprocess
 import sys
 import traceback
+import urllib.error
+import urllib.request
 
-from PySide6.QtCore import Signal, QThread
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
+from PySide6.QtCore import Qt, Signal, QThread, QUrl
+from PySide6.QtGui import (
+    QAction, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
+)
+from PySide6.QtPrintSupport import QPrintDialog, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
-    QProgressBar, QMessageBox, QFrame, QComboBox, QTextEdit
+    QProgressBar, QMessageBox, QFrame, QComboBox, QTextEdit, QDialog
 )
 
-from converter import convert_files_to_pdf
+from converter import convert_files_to_pdf, render_label_images
+from printing import make_printer, print_images
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.4"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
+GITHUB_REPO = "rsonori1984/zpl2pdf"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
+
+
+def parse_version(version):
+    normalized = version.strip().lstrip("vV")
+    if not re.fullmatch(r"\d+(?:\.\d+)*", normalized):
+        raise ValueError(f"Versão inválida: {version}")
+    return tuple(int(part) for part in normalized.split("."))
+
+
+def compare_versions(first, second):
+    first_parts = parse_version(first)
+    second_parts = parse_version(second)
+    length = max(len(first_parts), len(second_parts))
+    first_parts += (0,) * (length - len(first_parts))
+    second_parts += (0,) * (length - len(second_parts))
+    return (first_parts > second_parts) - (first_parts < second_parts)
 
 
 def resource_path(*parts):
     """Caminho de um recurso, funcionando rodando pelo Python e empacotado (.exe)."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, *parts)
+
+
+class UpdateCheckWorker(QThread):
+    update_available = Signal(str, str)
+    up_to_date = Signal(str)
+    check_error = Signal(str)
+
+    def __init__(self, current_version, parent=None):
+        super().__init__(parent)
+        self.current_version = current_version
+
+    def run(self):
+        request = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_API,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "zpl2pdf-update-checker",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                release = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                self.check_error.emit(
+                    "Nenhuma release publicada foi encontrada no GitHub."
+                )
+            else:
+                self.check_error.emit(
+                    f"O GitHub respondeu com erro HTTP {error.code}."
+                )
+            return
+        except urllib.error.URLError as error:
+            self.check_error.emit(
+                f"Não foi possível conectar ao GitHub: {error.reason}"
+            )
+            return
+        except (TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            self.check_error.emit(f"Falha ao consultar o GitHub: {error}")
+            return
+
+        if not isinstance(release, dict):
+            self.check_error.emit("O GitHub retornou uma resposta inesperada.")
+            return
+
+        latest_version = release.get("tag_name")
+        release_url = release.get("html_url")
+        if not isinstance(latest_version, str):
+            self.check_error.emit("A release do GitHub não contém uma tag de versão.")
+            return
+        if not isinstance(release_url, str) or not release_url.startswith(
+            GITHUB_RELEASES_URL + "/"
+        ):
+            release_url = GITHUB_RELEASES_URL
+
+        try:
+            comparison = compare_versions(latest_version, self.current_version)
+        except ValueError as error:
+            self.check_error.emit(str(error))
+            return
+
+        if comparison > 0:
+            self.update_available.emit(latest_version, release_url)
+        else:
+            self.up_to_date.emit(latest_version)
+
+
+# Variáveis que apontam para bibliotecas do snap / do app empacotado. Se um
+# programa externo (leitor de PDF) as herdar, pode carregar bibliotecas
+# incompatíveis e mostrar erros como "GLIBCXX_3.4.29 not found".
+_LIB_ENV_VARS = (
+    "LD_LIBRARY_PATH", "LD_PRELOAD", "GIO_MODULE_DIR", "GIO_EXTRA_MODULES",
+    "GTK_PATH", "GTK_EXE_PREFIX", "GTK_IM_MODULE_FILE",
+    "GDK_PIXBUF_MODULE_FILE", "GDK_PIXBUF_MODULEDIR", "LOCPATH",
+)
+
+
+def clean_env_for_external_apps():
+    """Cópia do ambiente, sem as variáveis de bibliotecas do snap (terminal do
+    VS Code instalado como snap) nem do PyInstaller, para abrir outros
+    programas (xdg-open) sem herdar bibliotecas incompatíveis."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False):
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original is not None:
+            env["LD_LIBRARY_PATH"] = original
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    if "SNAP" in env:
+        for name in _LIB_ENV_VARS:
+            env.pop(name, None)
+    return env
 
 
 class ConversionWorker(QThread):
@@ -52,6 +171,28 @@ class ConversionWorker(QThread):
         try:
             result = convert_files_to_pdf(
                 self.files, self.output_path, dpi=self.dpi,
+                progress_callback=lambda c, t, m: self.progress.emit(c, t, m),
+            )
+            self.finished_ok.emit(result)
+        except Exception:
+            self.finished_error.emit(traceback.format_exc())
+
+
+class RenderWorker(QThread):
+    """Renderiza as etiquetas em imagens (para imprimir), sem gerar PDF."""
+    progress = Signal(int, int, str)
+    finished_ok = Signal(object)
+    finished_error = Signal(str)
+
+    def __init__(self, files, dpi):
+        super().__init__()
+        self.files = files
+        self.dpi = dpi
+
+    def run(self):
+        try:
+            result = render_label_images(
+                self.files, dpi=self.dpi,
                 progress_callback=lambda c, t, m: self.progress.emit(c, t, m),
             )
             self.finished_ok.emit(result)
@@ -91,6 +232,9 @@ class MainWindow(QMainWindow):
         self.resize(680, 600)
         self.selected_files = []
         self.worker = None
+        self._update_worker = None
+        self._busy = False        # conversão, leitura ou impressão em andamento
+        self._close_box = None    # aviso "aguarde" (mantido para não repetir)
 
         self._build_menu()
 
@@ -109,7 +253,7 @@ class MainWindow(QMainWindow):
 
         subtitle = QLabel(
             "Arraste arquivos .zpl, .txt ou .zip aqui, ou use o botão abaixo.\n"
-            "Cada etiqueta será convertida em uma página de PDF no tamanho 10x15 cm."
+            "Converta para um PDF (uma página 10x15 cm por etiqueta) ou imprima direto."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #555;")
@@ -154,7 +298,19 @@ class MainWindow(QMainWindow):
             "QPushButton:disabled { background-color: #9ca3af; }"
         )
         self.btn_convert.clicked.connect(self.on_convert_clicked)
-        layout.addWidget(self.btn_convert)
+
+        self.btn_print = QPushButton("Imprimir...")
+        self.btn_print.setStyleSheet(
+            "QPushButton { background-color: white; color: #2563eb; padding: 10px; "
+            "font-weight: bold; border: 2px solid #2563eb; border-radius: 6px; } "
+            "QPushButton:disabled { color: #9ca3af; border-color: #9ca3af; }"
+        )
+        self.btn_print.clicked.connect(self.on_print_clicked)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.btn_convert, 2)
+        action_row.addWidget(self.btn_print, 1)
+        layout.addLayout(action_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -170,6 +326,38 @@ class MainWindow(QMainWindow):
         self.log_box.setPlaceholderText("Avisos e mensagens aparecerão aqui...")
         layout.addWidget(self.log_box)
 
+    def closeEvent(self, event):
+        # Fechar no meio de uma conversão, leitura ou impressão derrubaria o
+        # programa (thread ainda rodando) ou interromperia a impressão.
+        if (
+            self._busy
+            or (self.worker is not None and self.worker.isRunning())
+            or (
+                self._update_worker is not None
+                and self._update_worker.isRunning()
+            )
+        ):
+            self._warn_busy_on_close()
+            event.ignore()
+            return
+        event.accept()
+
+    def _warn_busy_on_close(self):
+        # Aviso que NÃO pausa o trabalho (open() não bloqueia): na impressão o
+        # laço de eventos precisa continuar rodando enquanto o aviso aparece.
+        if self._close_box is not None and self._close_box.isVisible():
+            return
+        box = QMessageBox(
+            QMessageBox.Icon.Information, APP_TITLE,
+            "Há uma operação em andamento (conversão, impressão ou "
+            "verificação de atualização).\n"
+            "Aguarde ela terminar para fechar o programa.",
+            QMessageBox.StandardButton.Ok, self,
+        )
+        box.setWindowModality(Qt.WindowModality.WindowModal)
+        box.open()
+        self._close_box = box
+
     # ------------------------------------------------------------------ #
     def _build_menu(self):
         help_menu = self.menuBar().addMenu("&Ajuda")
@@ -178,6 +366,14 @@ class MainWindow(QMainWindow):
         about_action.setShortcut(QKeySequence("F1"))
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
+
+        common_errors_action = QAction("Erros &comuns", self)
+        common_errors_action.triggered.connect(self.show_common_errors)
+        help_menu.addAction(common_errors_action)
+
+        self.update_checker_action = QAction("Verificar atualizações", self)
+        self.update_checker_action.triggered.connect(self.check_for_updates)
+        help_menu.addAction(self.update_checker_action)
 
         # about_qt_action = QAction("Sobre o &Qt", self)
         # about_qt_action.triggered.connect(QApplication.aboutQt)
@@ -190,12 +386,79 @@ class MainWindow(QMainWindow):
             f"<h3>{APP_TITLE}</h3>"
             f"<p>Versão {APP_VERSION}</p>"
             "<p>Converte arquivos ZPL (.zpl, .txt e .zip) em PDF no formato "
-            "de etiqueta 10x15 cm, pronto para impressão. Funciona 100% offline.</p>"
+            "de etiqueta 10x15 cm ou imprime direto na impressora. "
+            "Funciona 100% offline.</p>"
             "<p><b>Bibliotecas utilizadas:</b><br>"
             "PySide6 (interface), Pillow, ReportLab, python-barcode, qrcode "
             "e fonte DejaVu Sans Mono.</p>"
             f"<p>Desenvolvido por {APP_AUTHOR}.</p>"
         )
+
+    def show_common_errors(self):
+        QMessageBox.information(
+            self,
+            "Erros comuns",
+            "<h3>Erros comuns</h3>"
+            "<ul>"
+            "<li><b>Não há etiquetas para imprimir:</b> O arquivo não contém "
+            "comandos ZPL válidos, ou não há etiquetas completas (^XA...^XZ).</li>"
+            "<li><b>Falha ao imprimir:</b> Nenhuma impressora foi encontrada, ou "
+            "houve falha na comunicação com a impressora. Verifique se a impressora "
+            "está ligada, conectada e com drivers instalados.</li>"
+            "<li><b>Falha ao gerar PDF:</b> O arquivo de saída está aberto em outro "
+            "programa (como o Adobe Acrobat). Feche o arquivo e tente novamente.</li>"
+            "</ul>"
+        )
+
+    def check_for_updates(self):
+        if self._update_worker is not None and self._update_worker.isRunning():
+            return
+
+        self.update_checker_action.setEnabled(False)
+        worker = UpdateCheckWorker(APP_VERSION, self)
+        self._update_worker = worker
+        worker.update_available.connect(self.show_update_available)
+        worker.up_to_date.connect(self.show_up_to_date)
+        worker.check_error.connect(self.show_update_check_error)
+        worker.finished.connect(self.on_update_check_finished)
+        worker.start()
+
+    def show_update_available(self, version, release_url):
+        answer = QMessageBox.question(
+            self,
+            "Atualização disponível",
+            f"A versão {version} está disponível. "
+            f"Você está usando a versão {APP_VERSION}.\n\n"
+            "Deseja abrir a página da release no GitHub?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if (
+            answer == QMessageBox.StandardButton.Yes
+            and not QDesktopServices.openUrl(QUrl(release_url))
+        ):
+            QMessageBox.warning(
+                self, "Verificar atualizações",
+                "Não foi possível abrir o navegador. "
+                f"Acesse: {release_url}",
+            )
+
+    def show_up_to_date(self, latest_version):
+        if compare_versions(latest_version, APP_VERSION) == 0:
+            message = f"Você já está usando a versão mais recente ({latest_version})."
+        else:
+            message = (
+                f"Você está usando a versão {APP_VERSION}. "
+                f"A release mais recente publicada é {latest_version}."
+            )
+        QMessageBox.information(self, "Verificar atualizações", message)
+
+    def show_update_check_error(self, message):
+        QMessageBox.warning(self, "Verificar atualizações", message)
+
+    def on_update_check_finished(self):
+        self.update_checker_action.setEnabled(True)
+        self._update_worker = None
 
     # ------------------------------------------------------------------ #
     def dpi_value(self):
@@ -239,7 +502,7 @@ class MainWindow(QMainWindow):
         if not output_path.lower().endswith(".pdf"):
             output_path += ".pdf"
 
-        self.btn_convert.setEnabled(False)
+        self._set_busy(True)
         self.progress_bar.setValue(0)
         self.log_box.clear()
         self.status_label.setText("Convertendo...")
@@ -250,6 +513,77 @@ class MainWindow(QMainWindow):
         self.worker.finished_error.connect(self.on_finished_error)
         self.worker.start()
 
+    def _set_busy(self, busy):
+        self._busy = busy
+        self.btn_convert.setEnabled(not busy)
+        self.btn_print.setEnabled(not busy)
+
+    # --------------------------- impressão --------------------------- #
+    def on_print_clicked(self):
+        if not self.selected_files:
+            QMessageBox.warning(self, APP_TITLE, "Adicione pelo menos um arquivo .zpl, .txt ou .zip.")
+            return
+
+        if not QPrinterInfo.availablePrinterNames():
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "Nenhuma impressora foi encontrada neste computador.\n"
+                "Instale ou conecte uma impressora e tente novamente."
+            )
+            return
+
+        self._set_busy(True)
+        self.progress_bar.setValue(0)
+        self.log_box.clear()
+        self.status_label.setText("Preparando etiquetas para impressão...")
+
+        self.worker = RenderWorker(list(self.selected_files), self.dpi_value())
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_render_done)
+        self.worker.finished_error.connect(self.on_finished_error)
+        self.worker.start()
+
+    def on_render_done(self, result):
+        self._set_busy(False)
+        self.progress_bar.setValue(self.progress_bar.maximum())
+
+        for w in result.warnings:
+            self.log_box.append("⚠ " + w)
+
+        if not result.images:
+            self.status_label.setText("Não há etiquetas para imprimir. Veja os avisos abaixo.")
+            return
+
+        printer = make_printer()
+        dialog = QPrintDialog(printer, self)
+        dialog.setWindowTitle(f"Imprimir {len(result.images)} etiqueta(s)")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Impressão cancelada.")
+            return
+
+        self._set_busy(True)
+        self.progress_bar.setValue(0)
+        try:
+            print_images(result.images, printer, progress=self._on_print_progress)
+        except Exception as e:
+            self.status_label.setText("Falha ao imprimir.")
+            self.log_box.append(f"ERRO ao imprimir: {e}")
+            QMessageBox.critical(self, APP_TITLE, f"Não foi possível imprimir:\n{e}")
+            return
+        finally:
+            self._set_busy(False)
+
+        self.status_label.setText(
+            f"{len(result.images)} etiqueta(s) enviada(s) para a impressora."
+        )
+
+    def _on_print_progress(self, done, total):
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(done)
+        self.status_label.setText(f"Imprimindo etiqueta {done} de {total}...")
+        # mantém a janela respondendo durante a impressão de lotes grandes
+        QApplication.processEvents()
+
     def on_progress(self, cur, total, msg):
         if total > 0:
             self.progress_bar.setMaximum(total)
@@ -257,7 +591,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(msg)
 
     def on_finished_ok(self, result):
-        self.btn_convert.setEnabled(True)
+        self._set_busy(False)
         self.progress_bar.setValue(self.progress_bar.maximum())
 
         if result.pdf_path:
@@ -292,10 +626,10 @@ class MainWindow(QMainWindow):
                 self.open_file(result.pdf_path)
 
     def on_finished_error(self, error_text):
-        self.btn_convert.setEnabled(True)
-        self.status_label.setText("Ocorreu um erro durante a conversão.")
+        self._set_busy(False)
+        self.status_label.setText("Ocorreu um erro.")
         self.log_box.append("ERRO:\n" + error_text)
-        QMessageBox.critical(self, APP_TITLE, "Ocorreu um erro durante a conversão. Veja o log na janela.")
+        QMessageBox.critical(self, APP_TITLE, "Ocorreu um erro. Veja o log na janela.")
 
     @staticmethod
     def open_file(path):
@@ -305,7 +639,11 @@ class MainWindow(QMainWindow):
             elif sys.platform.startswith("win"):
                 os.startfile(path)  # noqa
             else:
-                subprocess.Popen(["xdg-open", path])
+                subprocess.Popen(
+                    ["xdg-open", path], env=clean_env_for_external_apps(),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
         except Exception:
             pass
 
