@@ -62,6 +62,15 @@ As informações que aparecem em *clique direito no .exe → Propriedades → De
 versão, atualize ali `filevers`, `prodvers`, `FileVersion` e `ProductVersion`
 (e `APP_VERSION` no `main.py`, para o menu Ajuda → Sobre).
 
+### Verificar atualizações
+
+No menu **Ajuda → Verificar atualizações**, o app consulta a última release
+publicada em [GitHub Releases](https://github.com/rsonori1984/zpl2pdf/releases)
+e compara a tag com `APP_VERSION` em `main.py`. Para publicar uma atualização,
+crie uma release estável com uma tag numérica, como `v1.1.3`, e atualize
+`APP_VERSION` e as versões em `version_info.txt`. A consulta precisa de internet;
+o app não baixa nem instala atualizações automaticamente.
+
 **Linux / macOS**:
 
 ```bash

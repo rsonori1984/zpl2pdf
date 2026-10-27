@@ -10,13 +10,19 @@ Como rodar (com Python instalado):
     python main.py
 """
 
+import json
 import os
+import re
 import subprocess
 import sys
 import traceback
+import urllib.error
+import urllib.request
 
-from PySide6.QtCore import Qt, Signal, QThread
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
+from PySide6.QtCore import Qt, Signal, QThread, QUrl
+from PySide6.QtGui import (
+    QAction, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
+)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -28,15 +34,99 @@ from converter import convert_files_to_pdf, render_label_images
 from printing import make_printer, print_images
 
 APP_TITLE = "ZPL/TXT/ZIP → PDF (Etiqueta 10x15)"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.4"
 APP_AUTHOR = "Rodrigo Onori"  # troque pelo seu nome ou da sua empresa
+GITHUB_REPO = "rsonori1984/zpl2pdf"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 ACCEPTED_EXT = (".zpl", ".txt", ".zip")
+
+
+def parse_version(version):
+    normalized = version.strip().lstrip("vV")
+    if not re.fullmatch(r"\d+(?:\.\d+)*", normalized):
+        raise ValueError(f"Versão inválida: {version}")
+    return tuple(int(part) for part in normalized.split("."))
+
+
+def compare_versions(first, second):
+    first_parts = parse_version(first)
+    second_parts = parse_version(second)
+    length = max(len(first_parts), len(second_parts))
+    first_parts += (0,) * (length - len(first_parts))
+    second_parts += (0,) * (length - len(second_parts))
+    return (first_parts > second_parts) - (first_parts < second_parts)
 
 
 def resource_path(*parts):
     """Caminho de um recurso, funcionando rodando pelo Python e empacotado (.exe)."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, *parts)
+
+
+class UpdateCheckWorker(QThread):
+    update_available = Signal(str, str)
+    up_to_date = Signal(str)
+    check_error = Signal(str)
+
+    def __init__(self, current_version, parent=None):
+        super().__init__(parent)
+        self.current_version = current_version
+
+    def run(self):
+        request = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_API,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "zpl2pdf-update-checker",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                release = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                self.check_error.emit(
+                    "Nenhuma release publicada foi encontrada no GitHub."
+                )
+            else:
+                self.check_error.emit(
+                    f"O GitHub respondeu com erro HTTP {error.code}."
+                )
+            return
+        except urllib.error.URLError as error:
+            self.check_error.emit(
+                f"Não foi possível conectar ao GitHub: {error.reason}"
+            )
+            return
+        except (TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            self.check_error.emit(f"Falha ao consultar o GitHub: {error}")
+            return
+
+        if not isinstance(release, dict):
+            self.check_error.emit("O GitHub retornou uma resposta inesperada.")
+            return
+
+        latest_version = release.get("tag_name")
+        release_url = release.get("html_url")
+        if not isinstance(latest_version, str):
+            self.check_error.emit("A release do GitHub não contém uma tag de versão.")
+            return
+        if not isinstance(release_url, str) or not release_url.startswith(
+            GITHUB_RELEASES_URL + "/"
+        ):
+            release_url = GITHUB_RELEASES_URL
+
+        try:
+            comparison = compare_versions(latest_version, self.current_version)
+        except ValueError as error:
+            self.check_error.emit(str(error))
+            return
+
+        if comparison > 0:
+            self.update_available.emit(latest_version, release_url)
+        else:
+            self.up_to_date.emit(latest_version)
 
 
 # Variáveis que apontam para bibliotecas do snap / do app empacotado. Se um
@@ -142,6 +232,7 @@ class MainWindow(QMainWindow):
         self.resize(680, 600)
         self.selected_files = []
         self.worker = None
+        self._update_worker = None
         self._busy = False        # conversão, leitura ou impressão em andamento
         self._close_box = None    # aviso "aguarde" (mantido para não repetir)
 
@@ -238,7 +329,14 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # Fechar no meio de uma conversão, leitura ou impressão derrubaria o
         # programa (thread ainda rodando) ou interromperia a impressão.
-        if self._busy or (self.worker is not None and self.worker.isRunning()):
+        if (
+            self._busy
+            or (self.worker is not None and self.worker.isRunning())
+            or (
+                self._update_worker is not None
+                and self._update_worker.isRunning()
+            )
+        ):
             self._warn_busy_on_close()
             event.ignore()
             return
@@ -251,7 +349,8 @@ class MainWindow(QMainWindow):
             return
         box = QMessageBox(
             QMessageBox.Icon.Information, APP_TITLE,
-            "Há uma operação em andamento (conversão ou impressão).\n"
+            "Há uma operação em andamento (conversão, impressão ou "
+            "verificação de atualização).\n"
             "Aguarde ela terminar para fechar o programa.",
             QMessageBox.StandardButton.Ok, self,
         )
@@ -271,6 +370,10 @@ class MainWindow(QMainWindow):
         common_errors_action = QAction("Erros &comuns", self)
         common_errors_action.triggered.connect(self.show_common_errors)
         help_menu.addAction(common_errors_action)
+
+        self.update_checker_action = QAction("Verificar atualizações", self)
+        self.update_checker_action.triggered.connect(self.check_for_updates)
+        help_menu.addAction(self.update_checker_action)
 
         # about_qt_action = QAction("Sobre o &Qt", self)
         # about_qt_action.triggered.connect(QApplication.aboutQt)
@@ -306,6 +409,56 @@ class MainWindow(QMainWindow):
             "programa (como o Adobe Acrobat). Feche o arquivo e tente novamente.</li>"
             "</ul>"
         )
+
+    def check_for_updates(self):
+        if self._update_worker is not None and self._update_worker.isRunning():
+            return
+
+        self.update_checker_action.setEnabled(False)
+        worker = UpdateCheckWorker(APP_VERSION, self)
+        self._update_worker = worker
+        worker.update_available.connect(self.show_update_available)
+        worker.up_to_date.connect(self.show_up_to_date)
+        worker.check_error.connect(self.show_update_check_error)
+        worker.finished.connect(self.on_update_check_finished)
+        worker.start()
+
+    def show_update_available(self, version, release_url):
+        answer = QMessageBox.question(
+            self,
+            "Atualização disponível",
+            f"A versão {version} está disponível. "
+            f"Você está usando a versão {APP_VERSION}.\n\n"
+            "Deseja abrir a página da release no GitHub?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if (
+            answer == QMessageBox.StandardButton.Yes
+            and not QDesktopServices.openUrl(QUrl(release_url))
+        ):
+            QMessageBox.warning(
+                self, "Verificar atualizações",
+                "Não foi possível abrir o navegador. "
+                f"Acesse: {release_url}",
+            )
+
+    def show_up_to_date(self, latest_version):
+        if compare_versions(latest_version, APP_VERSION) == 0:
+            message = f"Você já está usando a versão mais recente ({latest_version})."
+        else:
+            message = (
+                f"Você está usando a versão {APP_VERSION}. "
+                f"A release mais recente publicada é {latest_version}."
+            )
+        QMessageBox.information(self, "Verificar atualizações", message)
+
+    def show_update_check_error(self, message):
+        QMessageBox.warning(self, "Verificar atualizações", message)
+
+    def on_update_check_finished(self):
+        self.update_checker_action.setEnabled(True)
+        self._update_worker = None
 
     # ------------------------------------------------------------------ #
     def dpi_value(self):
